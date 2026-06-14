@@ -407,14 +407,53 @@ def current_user_view(request):
 def statistics_view(request):
     result = {}
 
-    total_headphones = Headphone.objects.count()
+    batch_no = request.GET.get('batch')
+    box_no = request.GET.get('box')
+    responsible_person = request.GET.get('responsible_person')
+    status = request.GET.get('status')
+    battery_min = request.GET.get('battery_min')
+    battery_max = request.GET.get('battery_max')
+    date_start = request.GET.get('date_start')
+    date_end = request.GET.get('date_end')
+    low_battery_threshold = int(request.GET.get('low_battery_threshold', 30))
+
+    hp_qs = Headphone.objects.all()
+    if batch_no:
+        hp_qs = hp_qs.filter(batch__batch_no__icontains=batch_no)
+    if box_no:
+        hp_qs = hp_qs.filter(box__box_no__icontains=box_no)
+    if responsible_person:
+        hp_qs = hp_qs.filter(responsible_person__icontains=responsible_person)
+    if status:
+        hp_qs = hp_qs.filter(status=status)
+    if battery_min:
+        hp_qs = hp_qs.filter(battery_level__gte=int(battery_min))
+    if battery_max:
+        hp_qs = hp_qs.filter(battery_level__lte=int(battery_max))
+    if date_start:
+        hp_qs = hp_qs.filter(created_at__date__gte=date_start)
+    if date_end:
+        hp_qs = hp_qs.filter(created_at__date__lte=date_end)
+
+    result['applied_filters'] = {
+        'batch': batch_no,
+        'box': box_no,
+        'responsible_person': responsible_person,
+        'status': status,
+        'battery_min': battery_min,
+        'battery_max': battery_max,
+        'date_start': date_start,
+        'date_end': date_end,
+        'low_battery_threshold': low_battery_threshold,
+    }
+
+    total_headphones = hp_qs.count()
     result['total_headphones'] = total_headphones
 
-    status_stats = Headphone.objects.values('status').annotate(count=Count('id'))
+    status_stats = hp_qs.values('status').annotate(count=Count('id'))
     result['status_stats'] = {item['status']: item['count'] for item in status_stats}
 
-    low_battery_threshold = request.GET.get('low_battery_threshold', 30)
-    low_battery_headphones = Headphone.objects.filter(
+    low_battery_headphones = hp_qs.filter(
         battery_level__lt=low_battery_threshold,
         status__in=[HeadphoneStatus.PENDING_BORROW, HeadphoneStatus.AVAILABLE, HeadphoneStatus.PENDING_REVIEW]
     )
@@ -424,7 +463,7 @@ def statistics_view(request):
         'headphones': HeadphoneListSerializer(low_battery_headphones, many=True).data
     }
 
-    pending_review_headphones = Headphone.objects.filter(
+    pending_review_headphones = hp_qs.filter(
         status=HeadphoneStatus.PENDING_REVIEW
     ).select_related('batch', 'box')
     result['pending_review'] = {
@@ -432,28 +471,30 @@ def statistics_view(request):
         'headphones': HeadphoneListSerializer(pending_review_headphones, many=True).data
     }
 
-    pending_disinfect_headphones = Headphone.objects.filter(
+    pending_disinfect_headphones = hp_qs.filter(
         status=HeadphoneStatus.PENDING_DISINFECT
     )
     result['pending_disinfect'] = {
         'count': pending_disinfect_headphones.count()
     }
 
-    in_use_count = Headphone.objects.filter(status=HeadphoneStatus.IN_USE).count()
+    in_use_count = hp_qs.filter(status=HeadphoneStatus.IN_USE).count()
     result['in_use'] = {
         'count': in_use_count
     }
 
-    terminal_conflicts = AbnormalRecord.objects.filter(
-        abnormal_type='terminal_conflict',
-        resolved=False
-    ).count()
+    abnormal_qs = AbnormalRecord.objects.filter(resolved=False)
+    if batch_no:
+        abnormal_qs = abnormal_qs.filter(
+            Q(headphone__batch__batch_no__icontains=batch_no) | Q(batch__batch_no__icontains=batch_no)
+        )
+    terminal_conflicts = abnormal_qs.filter(abnormal_type='terminal_conflict').count()
     result['terminal_conflict_count'] = terminal_conflicts
 
-    unresolved_abnormal = AbnormalRecord.objects.filter(resolved=False).count()
+    unresolved_abnormal = abnormal_qs.count()
     result['unresolved_abnormal'] = unresolved_abnormal
 
-    batch_stats = Headphone.objects.values(
+    batch_stats = hp_qs.values(
         'batch__batch_no', 'batch__name'
     ).annotate(
         total=Count('id'),
@@ -467,7 +508,10 @@ def statistics_view(request):
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def abnormal_detection_view(request):
-    result = {'detected': []}
+    auto_save = request.GET.get('save', 'true').lower() == 'true'
+    result = {'detected': [], 'saved_to_records': auto_save}
+
+    now = timezone.now()
 
     low_battery_list = []
     for headphone in Headphone.objects.all():
@@ -478,12 +522,23 @@ def abnormal_detection_view(request):
         ).order_by('-return_time')[:3]
 
         if recent.count() >= 3:
+            batteries = [r.battery_after for r in recent]
             low_battery_list.append({
                 'headphone_id': headphone.id,
                 'serial_no': headphone.serial_no,
                 'count': recent.count(),
-                'recent_batteries': [r.battery_after for r in recent]
+                'recent_batteries': batteries
             })
+            if auto_save:
+                AbnormalRecord.objects.get_or_create(
+                    headphone=headphone,
+                    abnormal_type='low_battery',
+                    resolved=False,
+                    defaults={
+                        'severity': 'medium',
+                        'description': f'耳机 {headphone.serial_no} 连续多次归还时电量低于30%，最近3次电量: {batteries}'
+                    }
+                )
 
     result['detected'].append({
         'type': 'low_battery',
@@ -497,14 +552,25 @@ def abnormal_detection_view(request):
         total = batch.headphones.count()
         damaged = batch.headphones.filter(earpad_damaged=True).count()
         if total > 0 and damaged / total > 0.3:
+            rate = round(damaged / total * 100, 2)
             batch_damage_list.append({
                 'batch_id': batch.id,
                 'batch_no': batch.batch_no,
                 'batch_name': batch.name,
                 'total': total,
                 'damaged': damaged,
-                'rate': round(damaged / total * 100, 2)
+                'rate': rate
             })
+            if auto_save:
+                AbnormalRecord.objects.get_or_create(
+                    batch=batch,
+                    abnormal_type='earpad_damage',
+                    resolved=False,
+                    defaults={
+                        'severity': 'high',
+                        'description': f'批次 {batch.batch_no} 耳罩破损比例过高: {damaged}/{total} ({rate}%)'
+                    }
+                )
 
     result['detected'].append({
         'type': 'earpad_damage',
@@ -518,9 +584,9 @@ def abnormal_detection_view(request):
         return_time__isnull=True,
         expected_return_time__isnull=False
     )
-    now = timezone.now()
     for record in active_borrows:
         if record.expected_return_time and now > record.expected_return_time:
+            overdue_hours = round((now - record.expected_return_time).total_seconds() / 3600, 1)
             overdue_list.append({
                 'record_id': record.id,
                 'headphone_id': record.headphone.id,
@@ -528,8 +594,18 @@ def abnormal_detection_view(request):
                 'borrower': record.borrower,
                 'borrow_time': record.borrow_time,
                 'expected_return_time': record.expected_return_time,
-                'overdue_hours': round((now - record.expected_return_time).total_seconds() / 3600, 1)
+                'overdue_hours': overdue_hours
             })
+            if auto_save:
+                AbnormalRecord.objects.get_or_create(
+                    headphone=record.headphone,
+                    abnormal_type='overdue',
+                    resolved=False,
+                    defaults={
+                        'severity': 'medium',
+                        'description': f'耳机 {record.headphone.serial_no} 被 {record.borrower} 领用后超时 {overdue_hours} 小时未归还'
+                    }
+                )
 
     result['detected'].append({
         'type': 'overdue',
@@ -547,12 +623,23 @@ def abnormal_detection_view(request):
             headphone=hp
         ).order_by('-disinfect_time').first()
         if last_disinfect and (now - last_disinfect.disinfect_time) > timedelta(hours=24):
+            pending_hours = round((now - last_disinfect.disinfect_time).total_seconds() / 3600, 1)
             review_missed_list.append({
                 'headphone_id': hp.id,
                 'serial_no': hp.serial_no,
                 'disinfect_time': last_disinfect.disinfect_time,
-                'pending_hours': round((now - last_disinfect.disinfect_time).total_seconds() / 3600, 1)
+                'pending_hours': pending_hours
             })
+            if auto_save:
+                AbnormalRecord.objects.get_or_create(
+                    headphone=hp,
+                    abnormal_type='review_missed',
+                    resolved=False,
+                    defaults={
+                        'severity': 'low',
+                        'description': f'耳机 {hp.serial_no} 消杀完成后超过 {pending_hours} 小时未复核'
+                    }
+                )
 
     result['detected'].append({
         'type': 'review_missed',
