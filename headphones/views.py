@@ -5,8 +5,9 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
+from django.db import transaction, IntegrityError
 from django.db.models import Count, Q, Avg, F
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from datetime import timedelta
 
 from .models import (
@@ -28,11 +29,18 @@ from .filters import (
 )
 
 
+def _is_user_admin(user):
+    try:
+        return user.profile.is_admin()
+    except (ObjectDoesNotExist, AttributeError):
+        return False
+
+
 class IsAdminOrReadOnly(permissions.BasePermission):
     def has_permission(self, request, view):
         if request.method in permissions.SAFE_METHODS:
             return True
-        return request.user.profile.is_admin()
+        return _is_user_admin(request.user)
 
 
 class BatchViewSet(viewsets.ModelViewSet):
@@ -153,6 +161,8 @@ class AbnormalRecordViewSet(viewsets.ModelViewSet):
 
 class HeadphoneActionView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+    LOW_BATTERY_THRESHOLD = 30
+    CONSECUTIVE_LOW_BATTERY_COUNT = 3
 
     @action(detail=False, methods=['post'])
     def post(self, request, action_type=None):
@@ -170,13 +180,14 @@ class HeadphoneActionView(APIView):
             return self._activate(request)
         return Response({'error': '未知操作类型'}, status=status.HTTP_400_BAD_REQUEST)
 
+    @transaction.atomic
     def _borrow(self, request):
         serializer = BorrowActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         try:
-            headphone = Headphone.objects.get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -206,13 +217,14 @@ class HeadphoneActionView(APIView):
         result = BorrowRecordSerializer(borrow_record).data
         return Response(result, status=status.HTTP_201_CREATED)
 
+    @transaction.atomic
     def _return(self, request):
         serializer = ReturnActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         try:
-            headphone = Headphone.objects.get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -222,7 +234,7 @@ class HeadphoneActionView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        borrow_record = BorrowRecord.objects.filter(
+        borrow_record = BorrowRecord.objects.select_for_update().filter(
             headphone=headphone,
             return_time__isnull=True
         ).order_by('-borrow_time').first()
@@ -239,12 +251,7 @@ class HeadphoneActionView(APIView):
 
         if borrow_record.expected_return_time and now > borrow_record.expected_return_time:
             borrow_record.is_overdue = True
-            AbnormalRecord.objects.create(
-                headphone=headphone,
-                abnormal_type='overdue',
-                severity='medium',
-                description=f'耳机 {headphone.serial_no} 归还超时，预计归还时间 {borrow_record.expected_return_time}'
-            )
+            self._create_overdue_abnormal(headphone, borrow_record)
 
         borrow_record.save()
 
@@ -255,19 +262,20 @@ class HeadphoneActionView(APIView):
         headphone.current_borrower = ''
         headphone.save()
 
-        self._check_low_battery(headphone, data['battery_after'])
+        self._check_consecutive_low_battery(headphone, data['battery_after'])
         self._check_terminal_conflict(headphone, borrow_record)
 
         result = BorrowRecordSerializer(borrow_record).data
         return Response(result, status=status.HTTP_200_OK)
 
+    @transaction.atomic
     def _disinfect(self, request):
         serializer = DisinfectActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         try:
-            headphone = Headphone.objects.get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -286,22 +294,33 @@ class HeadphoneActionView(APIView):
         )
 
         if data.get('result', True):
+            if headphone.box:
+                pending_count = Headphone.objects.filter(
+                    box=headphone.box,
+                    status=HeadphoneStatus.PENDING_REVIEW
+                ).exclude(pk=headphone.pk).count()
+                if pending_count >= headphone.box.capacity:
+                    return Response(
+                        {'error': f'盒位 {headphone.box.box_no} 已被待复核耳机占满，无法进入待复核状态'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
             headphone.status = HeadphoneStatus.PENDING_REVIEW
-            headphone.save()
         else:
             headphone.status = HeadphoneStatus.PENDING_DISINFECT
-            headphone.save()
+
+        headphone.save()
 
         result = DisinfectionRecordSerializer(disinfect_record).data
         return Response(result, status=status.HTTP_201_CREATED)
 
+    @transaction.atomic
     def _review(self, request):
         serializer = ReviewActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         try:
-            headphone = Headphone.objects.get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -311,37 +330,56 @@ class HeadphoneActionView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        passed = data.get('passed', True)
+        earpad_damaged = data.get('earpad_damaged', False)
+        battery_ok = data.get('battery_ok', True)
+        appearance_ok = data.get('appearance_ok', True)
+        function_ok = data.get('function_ok', True)
+
+        if passed and not (battery_ok and appearance_ok and function_ok):
+            passed = False
+
         review_record = ReviewRecord.objects.create(
             headphone=headphone,
             reviewer=request.user,
-            passed=data.get('passed', True),
-            earpad_damaged=data.get('earpad_damaged', False),
-            battery_ok=data.get('battery_ok', True),
-            appearance_ok=data.get('appearance_ok', True),
-            function_ok=data.get('function_ok', True),
+            passed=passed,
+            earpad_damaged=earpad_damaged,
+            battery_ok=battery_ok,
+            appearance_ok=appearance_ok,
+            function_ok=function_ok,
             remark=data.get('remark', '')
         )
 
-        if data.get('passed', True):
+        if passed:
             headphone.status = HeadphoneStatus.AVAILABLE
-            if data.get('earpad_damaged', False):
+            if earpad_damaged:
                 headphone.earpad_damaged = True
         else:
             headphone.status = HeadphoneStatus.OUT_OF_SERVICE
-            headphone.suspend_reason = data.get('remark', '复核不通过')
+            reasons = []
+            if not battery_ok:
+                reasons.append('电量异常')
+            if not appearance_ok or earpad_damaged:
+                reasons.append('外观异常')
+            if not function_ok:
+                reasons.append('功能异常')
+            if not reasons:
+                reasons.append('复核不通过')
+            headphone.suspend_reason = data.get('remark', '、'.join(reasons))
 
         headphone.save()
 
         result = ReviewRecordSerializer(review_record).data
         return Response(result, status=status.HTTP_201_CREATED)
 
+    @transaction.atomic
     def _suspend(self, request):
         serializer = SuspendActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         try:
-            headphone = Headphone.objects.get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -358,13 +396,14 @@ class HeadphoneActionView(APIView):
         result = HeadphoneSerializer(headphone).data
         return Response(result, status=status.HTTP_200_OK)
 
+    @transaction.atomic
     def _activate(self, request):
         headphone_id = request.data.get('headphone_id')
         if not headphone_id:
             return Response({'error': '缺少 headphone_id 参数'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            headphone = Headphone.objects.get(pk=headphone_id)
+            headphone = Headphone.objects.select_for_update().get(pk=headphone_id)
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -374,6 +413,17 @@ class HeadphoneActionView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        if headphone.box:
+            pending_count = Headphone.objects.filter(
+                box=headphone.box,
+                status=HeadphoneStatus.PENDING_REVIEW
+            ).exclude(pk=headphone.pk).count()
+            if pending_count >= headphone.box.capacity:
+                return Response(
+                    {'error': f'盒位 {headphone.box.box_no} 已被待复核耳机占满，无法进入待复核状态'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         headphone.status = HeadphoneStatus.PENDING_REVIEW
         headphone.suspend_reason = ''
         headphone.save()
@@ -381,22 +431,51 @@ class HeadphoneActionView(APIView):
         result = HeadphoneSerializer(headphone).data
         return Response(result, status=status.HTTP_200_OK)
 
-    def _check_low_battery(self, headphone, battery):
-        recent_low_count = BorrowRecord.objects.filter(
+    def _check_consecutive_low_battery(self, headphone, current_battery):
+        recent_records = BorrowRecord.objects.filter(
             headphone=headphone,
-            battery_after__lt=30,
             return_time__isnull=False
-        ).order_by('-return_time')[:3].count()
+        ).order_by('-return_time')[:self.CONSECUTIVE_LOW_BATTERY_COUNT]
 
-        if recent_low_count >= 3:
+        if recent_records.count() < self.CONSECUTIVE_LOW_BATTERY_COUNT:
+            return
+
+        all_low = all(
+            record.battery_after is not None and record.battery_after < self.LOW_BATTERY_THRESHOLD
+            for record in recent_records
+        )
+
+        if all_low and current_battery < self.LOW_BATTERY_THRESHOLD:
+            batteries = [r.battery_after for r in recent_records]
             AbnormalRecord.objects.get_or_create(
                 headphone=headphone,
                 abnormal_type='low_battery',
                 status=AbnormalStatus.PENDING,
                 defaults={
                     'severity': 'medium',
-                    'description': f'耳机 {headphone.serial_no} 连续多次归还时电量低于30%，当前电量 {battery}%'
+                    'description': (
+                        f'耳机 {headphone.serial_no} 连续 {self.CONSECUTIVE_LOW_BATTERY_COUNT} 次'
+                        f'归还时电量低于{self.LOW_BATTERY_THRESHOLD}%，'
+                        f'最近电量: {batteries}'
+                    )
                 }
+            )
+
+    def _create_overdue_abnormal(self, headphone, borrow_record):
+        existing = AbnormalRecord.objects.filter(
+            headphone=headphone,
+            abnormal_type='overdue',
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).exists()
+        if not existing:
+            AbnormalRecord.objects.create(
+                headphone=headphone,
+                abnormal_type='overdue',
+                severity='medium',
+                description=(
+                    f'耳机 {headphone.serial_no} 归还超时，'
+                    f'预计归还时间 {borrow_record.expected_return_time}'
+                )
             )
 
     def _check_terminal_conflict(self, headphone, borrow_record):
@@ -406,13 +485,21 @@ class HeadphoneActionView(APIView):
 
         compatible_list = [t.strip() for t in headphone.compatible_terminal.split(',')]
         if terminal_used not in compatible_list:
-            AbnormalRecord.objects.create(
+            existing = AbnormalRecord.objects.filter(
                 headphone=headphone,
                 abnormal_type='terminal_conflict',
-                severity='low',
-                description=f'耳机 {headphone.serial_no} 适配终端为 {headphone.compatible_terminal}，'
-                            f'实际使用终端为 {terminal_used}'
-            )
+                status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+            ).exists()
+            if not existing:
+                AbnormalRecord.objects.create(
+                    headphone=headphone,
+                    abnormal_type='terminal_conflict',
+                    severity='low',
+                    description=(
+                        f'耳机 {headphone.serial_no} 适配终端为 {headphone.compatible_terminal}，'
+                        f'实际使用终端为 {terminal_used}'
+                    )
+                )
 
 
 @api_view(['POST'])
@@ -445,6 +532,20 @@ def current_user_view(request):
     return Response(serializer.data)
 
 
+def _safe_int(value, default=None, min_value=None, max_value=None):
+    if value is None:
+        return default
+    try:
+        result = int(value)
+    except (ValueError, TypeError):
+        return default
+    if min_value is not None and result < min_value:
+        return default
+    if max_value is not None and result > max_value:
+        return default
+    return result
+
+
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def statistics_view(request):
@@ -454,11 +555,16 @@ def statistics_view(request):
     box_no = request.GET.get('box')
     responsible_person = request.GET.get('responsible_person')
     status = request.GET.get('status')
-    battery_min = request.GET.get('battery_min')
-    battery_max = request.GET.get('battery_max')
+    battery_min = _safe_int(request.GET.get('battery_min'), min_value=0, max_value=100)
+    battery_max = _safe_int(request.GET.get('battery_max'), min_value=0, max_value=100)
     date_start = request.GET.get('date_start')
     date_end = request.GET.get('date_end')
-    low_battery_threshold = int(request.GET.get('low_battery_threshold', 30))
+    low_battery_threshold = _safe_int(
+        request.GET.get('low_battery_threshold'),
+        default=30,
+        min_value=1,
+        max_value=99
+    )
 
     hp_qs = Headphone.objects.all()
     if batch_no:
@@ -468,15 +574,23 @@ def statistics_view(request):
     if responsible_person:
         hp_qs = hp_qs.filter(responsible_person__icontains=responsible_person)
     if status:
-        hp_qs = hp_qs.filter(status=status)
-    if battery_min:
-        hp_qs = hp_qs.filter(battery_level__gte=int(battery_min))
-    if battery_max:
-        hp_qs = hp_qs.filter(battery_level__lte=int(battery_max))
+        valid_statuses = [s for s, _ in HeadphoneStatus.choices]
+        if status in valid_statuses:
+            hp_qs = hp_qs.filter(status=status)
+    if battery_min is not None:
+        hp_qs = hp_qs.filter(battery_level__gte=battery_min)
+    if battery_max is not None:
+        hp_qs = hp_qs.filter(battery_level__lte=battery_max)
     if date_start:
-        hp_qs = hp_qs.filter(created_at__date__gte=date_start)
+        try:
+            hp_qs = hp_qs.filter(created_at__date__gte=date_start)
+        except ValueError:
+            pass
     if date_end:
-        hp_qs = hp_qs.filter(created_at__date__lte=date_end)
+        try:
+            hp_qs = hp_qs.filter(created_at__date__lte=date_end)
+        except ValueError:
+            pass
 
     result['applied_filters'] = {
         'batch': batch_no,
@@ -577,37 +691,26 @@ def statistics_view(request):
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def abnormal_detection_view(request):
-    auto_save = request.GET.get('save', 'true').lower() == 'true'
+    auto_save = request.GET.get('save', 'false').lower() == 'true'
     result = {'detected': [], 'saved_to_records': auto_save}
+    consecutive_count = _safe_int(
+        request.GET.get('consecutive_count'),
+        default=3,
+        min_value=2,
+        max_value=10
+    )
+    low_battery_threshold = _safe_int(
+        request.GET.get('low_battery_threshold'),
+        default=30,
+        min_value=1,
+        max_value=99
+    )
 
     now = timezone.now()
 
-    low_battery_list = []
-    for headphone in Headphone.objects.all():
-        recent = BorrowRecord.objects.filter(
-            headphone=headphone,
-            battery_after__lt=30,
-            return_time__isnull=False
-        ).order_by('-return_time')[:3]
-
-        if recent.count() >= 3:
-            batteries = [r.battery_after for r in recent]
-            low_battery_list.append({
-                'headphone_id': headphone.id,
-                'serial_no': headphone.serial_no,
-                'count': recent.count(),
-                'recent_batteries': batteries
-            })
-            if auto_save:
-                AbnormalRecord.objects.get_or_create(
-                    headphone=headphone,
-                    abnormal_type='low_battery',
-                    status=AbnormalStatus.PENDING,
-                    defaults={
-                        'severity': 'medium',
-                        'description': f'耳机 {headphone.serial_no} 连续多次归还时电量低于30%，最近3次电量: {batteries}'
-                    }
-                )
+    low_battery_list = _detect_consecutive_low_battery(consecutive_count, low_battery_threshold)
+    if auto_save:
+        _save_low_battery_abnormal(low_battery_list, consecutive_count, low_battery_threshold)
 
     result['detected'].append({
         'type': 'low_battery',
@@ -616,6 +719,91 @@ def abnormal_detection_view(request):
         'items': low_battery_list
     })
 
+    batch_damage_list = _detect_batch_earpad_damage()
+    if auto_save:
+        _save_batch_damage_abnormal(batch_damage_list)
+
+    result['detected'].append({
+        'type': 'earpad_damage',
+        'name': '同批次耳罩破损偏多',
+        'count': len(batch_damage_list),
+        'items': batch_damage_list
+    })
+
+    overdue_list = _detect_overdue(now)
+    if auto_save:
+        _save_overdue_abnormal(overdue_list)
+
+    result['detected'].append({
+        'type': 'overdue',
+        'name': '归还超时',
+        'count': len(overdue_list),
+        'items': overdue_list
+    })
+
+    review_missed_list = _detect_review_missed(now)
+    if auto_save:
+        _save_review_missed_abnormal(review_missed_list)
+
+    result['detected'].append({
+        'type': 'review_missed',
+        'name': '复核遗漏',
+        'count': len(review_missed_list),
+        'items': review_missed_list
+    })
+
+    return Response(result)
+
+
+def _detect_consecutive_low_battery(consecutive_count, threshold):
+    low_battery_list = []
+    for headphone in Headphone.objects.all():
+        recent_records = BorrowRecord.objects.filter(
+            headphone=headphone,
+            return_time__isnull=False
+        ).order_by('-return_time')[:consecutive_count]
+
+        if recent_records.count() < consecutive_count:
+            continue
+
+        all_low = all(
+            record.battery_after is not None and record.battery_after < threshold
+            for record in recent_records
+        )
+
+        if all_low:
+            batteries = [r.battery_after for r in recent_records]
+            low_battery_list.append({
+                'headphone_id': headphone.id,
+                'serial_no': headphone.serial_no,
+                'count': consecutive_count,
+                'recent_batteries': batteries
+            })
+    return low_battery_list
+
+
+def _save_low_battery_abnormal(items, consecutive_count, threshold):
+    for item in items:
+        headphone = Headphone.objects.get(pk=item['headphone_id'])
+        existing = AbnormalRecord.objects.filter(
+            headphone=headphone,
+            abnormal_type='low_battery',
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).exists()
+        if not existing:
+            AbnormalRecord.objects.create(
+                headphone=headphone,
+                abnormal_type='low_battery',
+                severity='medium',
+                description=(
+                    f'耳机 {headphone.serial_no} 连续 {consecutive_count} 次'
+                    f'归还时电量低于{threshold}%，'
+                    f'最近电量: {item["recent_batteries"]}'
+                )
+            )
+
+
+def _detect_batch_earpad_damage():
     batch_damage_list = []
     for batch in Batch.objects.all():
         total = batch.headphones.count()
@@ -630,29 +818,35 @@ def abnormal_detection_view(request):
                 'damaged': damaged,
                 'rate': rate
             })
-            if auto_save:
-                AbnormalRecord.objects.get_or_create(
-                    batch=batch,
-                    abnormal_type='earpad_damage',
-                    status=AbnormalStatus.PENDING,
-                    defaults={
-                        'severity': 'high',
-                        'description': f'批次 {batch.batch_no} 耳罩破损比例过高: {damaged}/{total} ({rate}%)'
-                    }
+    return batch_damage_list
+
+
+def _save_batch_damage_abnormal(items):
+    for item in items:
+        batch = Batch.objects.get(pk=item['batch_id'])
+        existing = AbnormalRecord.objects.filter(
+            batch=batch,
+            abnormal_type='earpad_damage',
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).exists()
+        if not existing:
+            AbnormalRecord.objects.create(
+                batch=batch,
+                abnormal_type='earpad_damage',
+                severity='high',
+                description=(
+                    f'批次 {batch.batch_no} 耳罩破损比例过高: '
+                    f'{item["damaged"]}/{item["total"]} ({item["rate"]}%)'
                 )
+            )
 
-    result['detected'].append({
-        'type': 'earpad_damage',
-        'name': '同批次耳罩破损偏多',
-        'count': len(batch_damage_list),
-        'items': batch_damage_list
-    })
 
+def _detect_overdue(now):
     overdue_list = []
     active_borrows = BorrowRecord.objects.filter(
         return_time__isnull=True,
         expected_return_time__isnull=False
-    )
+    ).select_related('headphone')
     for record in active_borrows:
         if record.expected_return_time and now > record.expected_return_time:
             overdue_hours = round((now - record.expected_return_time).total_seconds() / 3600, 1)
@@ -665,24 +859,30 @@ def abnormal_detection_view(request):
                 'expected_return_time': record.expected_return_time,
                 'overdue_hours': overdue_hours
             })
-            if auto_save:
-                AbnormalRecord.objects.get_or_create(
-                    headphone=record.headphone,
-                    abnormal_type='overdue',
-                    status=AbnormalStatus.PENDING,
-                    defaults={
-                        'severity': 'medium',
-                        'description': f'耳机 {record.headphone.serial_no} 被 {record.borrower} 领用后超时 {overdue_hours} 小时未归还'
-                    }
+    return overdue_list
+
+
+def _save_overdue_abnormal(items):
+    for item in items:
+        headphone = Headphone.objects.get(pk=item['headphone_id'])
+        existing = AbnormalRecord.objects.filter(
+            headphone=headphone,
+            abnormal_type='overdue',
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).exists()
+        if not existing:
+            AbnormalRecord.objects.create(
+                headphone=headphone,
+                abnormal_type='overdue',
+                severity='medium',
+                description=(
+                    f'耳机 {headphone.serial_no} 被 {item["borrower"]} 领用后'
+                    f'超时 {item["overdue_hours"]} 小时未归还'
                 )
+            )
 
-    result['detected'].append({
-        'type': 'overdue',
-        'name': '归还超时',
-        'count': len(overdue_list),
-        'items': overdue_list
-    })
 
+def _detect_review_missed(now):
     review_missed_list = []
     pending_review_headphones = Headphone.objects.filter(
         status=HeadphoneStatus.PENDING_REVIEW
@@ -699,22 +899,24 @@ def abnormal_detection_view(request):
                 'disinfect_time': last_disinfect.disinfect_time,
                 'pending_hours': pending_hours
             })
-            if auto_save:
-                AbnormalRecord.objects.get_or_create(
-                    headphone=hp,
-                    abnormal_type='review_missed',
-                    status=AbnormalStatus.PENDING,
-                    defaults={
-                        'severity': 'low',
-                        'description': f'耳机 {hp.serial_no} 消杀完成后超过 {pending_hours} 小时未复核'
-                    }
+    return review_missed_list
+
+
+def _save_review_missed_abnormal(items):
+    for item in items:
+        headphone = Headphone.objects.get(pk=item['headphone_id'])
+        existing = AbnormalRecord.objects.filter(
+            headphone=headphone,
+            abnormal_type='review_missed',
+            status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+        ).exists()
+        if not existing:
+            AbnormalRecord.objects.create(
+                headphone=headphone,
+                abnormal_type='review_missed',
+                severity='low',
+                description=(
+                    f'耳机 {headphone.serial_no} 消杀完成后'
+                    f'超过 {item["pending_hours"]} 小时未复核'
                 )
-
-    result['detected'].append({
-        'type': 'review_missed',
-        'name': '复核遗漏',
-        'count': len(review_missed_list),
-        'items': review_missed_list
-    })
-
-    return Response(result)
+            )

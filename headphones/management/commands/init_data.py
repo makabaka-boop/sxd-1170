@@ -1,3 +1,6 @@
+import os
+import secrets
+import string
 from django.core.management.base import BaseCommand
 from django.contrib.auth.models import User
 from django.utils import timezone
@@ -8,6 +11,11 @@ from headphones.models import (
     ReviewRecord, AbnormalRecord, UserProfile, UserRole, HeadphoneStatus,
     AbnormalStatus
 )
+
+
+def _generate_random_password(length=16):
+    alphabet = string.ascii_letters + string.digits + string.punctuation
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
 class Command(BaseCommand):
@@ -44,11 +52,22 @@ class Command(BaseCommand):
             self.stdout.write('  - 检测到已有流转记录，跳过示例数据创建（使用 --reset 强制重建）')
 
         self.stdout.write(self.style.SUCCESS('数据初始化完成！'))
-        self.stdout.write('管理员账号: admin / admin123456')
-        self.stdout.write('现场人员账号: staff / staff123456')
+        if hasattr(self, 'admin_password'):
+            self.stdout.write(f'管理员账号: admin / {self.admin_password}')
+        else:
+            self.stdout.write('管理员账号: admin (密码未变更)')
+        if hasattr(self, 'staff_password'):
+            self.stdout.write(f'现场人员账号: staff / {self.staff_password}')
+        else:
+            self.stdout.write('现场人员账号: staff (密码未变更)')
+        self.stdout.write('提示: 建议首次登录后修改默认密码')
 
     def _create_users(self):
         self.stdout.write('  - 创建用户账号...')
+
+        admin_password = os.environ.get('ADMIN_PASSWORD')
+        if not admin_password:
+            admin_password = _generate_random_password()
 
         admin_user, created = User.objects.get_or_create(
             username='admin',
@@ -61,14 +80,23 @@ class Command(BaseCommand):
             }
         )
         if created:
-            admin_user.set_password('admin123456')
+            admin_user.set_password(admin_password)
             admin_user.save()
+            self.admin_password = admin_password
+        elif os.environ.get('FORCE_RESET_PASSWORD', 'false').lower() == 'true':
+            admin_user.set_password(admin_password)
+            admin_user.save()
+            self.admin_password = admin_password
 
         admin_profile, _ = UserProfile.objects.get_or_create(user=admin_user)
         admin_profile.role = UserRole.ADMIN
         admin_profile.phone = '13800138001'
         admin_profile.department = '运维管理部'
         admin_profile.save()
+
+        staff_password = os.environ.get('STAFF_PASSWORD')
+        if not staff_password:
+            staff_password = _generate_random_password()
 
         staff_user, created = User.objects.get_or_create(
             username='staff',
@@ -81,8 +109,13 @@ class Command(BaseCommand):
             }
         )
         if created:
-            staff_user.set_password('staff123456')
+            staff_user.set_password(staff_password)
             staff_user.save()
+            self.staff_password = staff_password
+        elif os.environ.get('FORCE_RESET_PASSWORD', 'false').lower() == 'true':
+            staff_user.set_password(staff_password)
+            staff_user.save()
+            self.staff_password = staff_password
 
         staff_profile, _ = UserProfile.objects.get_or_create(user=staff_user)
         staff_profile.role = UserRole.FIELD_STAFF
