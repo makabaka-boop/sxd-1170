@@ -49,13 +49,16 @@ class AbnormalRecordFilter(django_filters.FilterSet):
     severity = django_filters.CharFilter(lookup_expr='exact')
     headphone = django_filters.CharFilter(field_name='headphone__serial_no', lookup_expr='icontains')
     batch = django_filters.CharFilter(field_name='batch__batch_no', lookup_expr='icontains')
-    resolved = django_filters.BooleanFilter()
+    status = django_filters.CharFilter(lookup_expr='exact')
+    handler = django_filters.CharFilter(field_name='handler__username', lookup_expr='icontains')
     detected_start = django_filters.DateTimeFilter(field_name='detected_time', lookup_expr='gte')
     detected_end = django_filters.DateTimeFilter(field_name='detected_time', lookup_expr='lte')
+    handle_start = django_filters.DateTimeFilter(field_name='handle_time', lookup_expr='gte')
+    handle_end = django_filters.DateTimeFilter(field_name='handle_time', lookup_expr='lte')
 
     class Meta:
         model = AbnormalRecord
-        fields = ['abnormal_type', 'severity', 'resolved']
+        fields = ['abnormal_type', 'severity', 'status']
 
 
 class DisinfectionRecordFilter(django_filters.FilterSet):

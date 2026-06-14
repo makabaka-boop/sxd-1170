@@ -11,12 +11,14 @@ from datetime import timedelta
 
 from .models import (
     Batch, Box, Headphone, BorrowRecord, DisinfectionRecord,
-    ReviewRecord, AbnormalRecord, UserProfile, HeadphoneStatus, UserRole
+    ReviewRecord, AbnormalRecord, UserProfile, HeadphoneStatus,
+    UserRole, AbnormalStatus
 )
 from .serializers import (
     BatchSerializer, BoxSerializer, HeadphoneSerializer, HeadphoneListSerializer,
     BorrowRecordSerializer, DisinfectionRecordSerializer, ReviewRecordSerializer,
-    AbnormalRecordSerializer, BorrowActionSerializer, ReturnActionSerializer,
+    AbnormalRecordSerializer, AbnormalHandleSerializer,
+    BorrowActionSerializer, ReturnActionSerializer,
     DisinfectActionSerializer, ReviewActionSerializer, SuspendActionSerializer,
     UserSerializer, LoginSerializer
 )
@@ -100,12 +102,53 @@ class AbnormalRecordViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     filterset_class = AbnormalRecordFilter
     search_fields = ['description']
-    ordering_fields = ['detected_time', 'severity']
+    ordering_fields = ['detected_time', 'severity', 'handle_time']
 
     def get_permissions(self):
-        if self.action in ['create', 'destroy']:
+        if self.action in ['create', 'destroy', 'confirm', 'resolve']:
             return [permissions.IsAuthenticated(), IsAdminOrReadOnly()]
         return [permissions.IsAuthenticated()]
+
+    @action(detail=True, methods=['post'])
+    def confirm(self, request, pk=None):
+        abnormal = self.get_object()
+        if abnormal.status != AbnormalStatus.PENDING:
+            return Response(
+                {'error': '只有未处理的异常才能确认'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        serializer = AbnormalHandleSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        abnormal.status = AbnormalStatus.PROCESSING
+        abnormal.handler = request.user
+        abnormal.resolve_remark = data.get('remark', '')
+        abnormal.save()
+
+        result = AbnormalRecordSerializer(abnormal).data
+        return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        abnormal = self.get_object()
+        if abnormal.status == AbnormalStatus.RESOLVED:
+            return Response(
+                {'error': '该异常已处理完成'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        serializer = AbnormalHandleSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        abnormal.status = AbnormalStatus.RESOLVED
+        abnormal.handler = request.user
+        abnormal.handle_time = timezone.now()
+        abnormal.resolve_remark = data.get('remark', abnormal.resolve_remark)
+        abnormal.save()
+
+        result = AbnormalRecordSerializer(abnormal).data
+        return Response(result, status=status.HTTP_200_OK)
 
 
 class HeadphoneActionView(APIView):
@@ -349,7 +392,7 @@ class HeadphoneActionView(APIView):
             AbnormalRecord.objects.get_or_create(
                 headphone=headphone,
                 abnormal_type='low_battery',
-                resolved=False,
+                status=AbnormalStatus.PENDING,
                 defaults={
                     'severity': 'medium',
                     'description': f'耳机 {headphone.serial_no} 连续多次归还时电量低于30%，当前电量 {battery}%'
@@ -483,15 +526,41 @@ def statistics_view(request):
         'count': in_use_count
     }
 
-    abnormal_qs = AbnormalRecord.objects.filter(resolved=False)
+    abnormal_qs = AbnormalRecord.objects.all()
     if batch_no:
         abnormal_qs = abnormal_qs.filter(
             Q(headphone__batch__batch_no__icontains=batch_no) | Q(batch__batch_no__icontains=batch_no)
         )
-    terminal_conflicts = abnormal_qs.filter(abnormal_type='terminal_conflict').count()
+
+    pending_abnormal = abnormal_qs.filter(status=AbnormalStatus.PENDING).count()
+    processing_abnormal = abnormal_qs.filter(status=AbnormalStatus.PROCESSING).count()
+    resolved_abnormal = abnormal_qs.filter(status=AbnormalStatus.RESOLVED).count()
+    total_abnormal = abnormal_qs.count()
+
+    result['abnormal_stats'] = {
+        'total': total_abnormal,
+        'pending': pending_abnormal,
+        'processing': processing_abnormal,
+        'resolved': resolved_abnormal,
+    }
+
+    type_distribution = abnormal_qs.values('abnormal_type').annotate(count=Count('id'))
+    result['abnormal_type_distribution'] = [
+        {
+            'type': item['abnormal_type'],
+            'type_display': dict(AbnormalRecord.ABNORMAL_TYPES).get(item['abnormal_type'], item['abnormal_type']),
+            'count': item['count']
+        }
+        for item in type_distribution
+    ]
+
+    terminal_conflicts = abnormal_qs.filter(
+        abnormal_type='terminal_conflict',
+        status__in=[AbnormalStatus.PENDING, AbnormalStatus.PROCESSING]
+    ).count()
     result['terminal_conflict_count'] = terminal_conflicts
 
-    unresolved_abnormal = abnormal_qs.count()
+    unresolved_abnormal = pending_abnormal + processing_abnormal
     result['unresolved_abnormal'] = unresolved_abnormal
 
     batch_stats = hp_qs.values(
@@ -533,7 +602,7 @@ def abnormal_detection_view(request):
                 AbnormalRecord.objects.get_or_create(
                     headphone=headphone,
                     abnormal_type='low_battery',
-                    resolved=False,
+                    status=AbnormalStatus.PENDING,
                     defaults={
                         'severity': 'medium',
                         'description': f'耳机 {headphone.serial_no} 连续多次归还时电量低于30%，最近3次电量: {batteries}'
@@ -565,7 +634,7 @@ def abnormal_detection_view(request):
                 AbnormalRecord.objects.get_or_create(
                     batch=batch,
                     abnormal_type='earpad_damage',
-                    resolved=False,
+                    status=AbnormalStatus.PENDING,
                     defaults={
                         'severity': 'high',
                         'description': f'批次 {batch.batch_no} 耳罩破损比例过高: {damaged}/{total} ({rate}%)'
@@ -600,7 +669,7 @@ def abnormal_detection_view(request):
                 AbnormalRecord.objects.get_or_create(
                     headphone=record.headphone,
                     abnormal_type='overdue',
-                    resolved=False,
+                    status=AbnormalStatus.PENDING,
                     defaults={
                         'severity': 'medium',
                         'description': f'耳机 {record.headphone.serial_no} 被 {record.borrower} 领用后超时 {overdue_hours} 小时未归还'
@@ -634,7 +703,7 @@ def abnormal_detection_view(request):
                 AbnormalRecord.objects.get_or_create(
                     headphone=hp,
                     abnormal_type='review_missed',
-                    resolved=False,
+                    status=AbnormalStatus.PENDING,
                     defaults={
                         'severity': 'low',
                         'description': f'耳机 {hp.serial_no} 消杀完成后超过 {pending_hours} 小时未复核'

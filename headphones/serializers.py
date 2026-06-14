@@ -115,11 +115,13 @@ class AbnormalRecordSerializer(serializers.ModelSerializer):
     batch_no = serializers.CharField(source='batch.batch_no', read_only=True, allow_null=True)
     abnormal_type_display = serializers.CharField(source='get_abnormal_type_display', read_only=True)
     severity_display = serializers.CharField(source='get_severity_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    handler_name = serializers.CharField(source='handler.username', read_only=True, allow_null=True)
 
     class Meta:
         model = AbnormalRecord
         fields = '__all__'
-        read_only_fields = ['detected_time']
+        read_only_fields = ['detected_time', 'handler', 'handle_time']
 
 
 class BorrowActionSerializer(serializers.Serializer):
@@ -156,6 +158,10 @@ class ReviewActionSerializer(serializers.Serializer):
 class SuspendActionSerializer(serializers.Serializer):
     headphone_id = serializers.IntegerField()
     reason = serializers.CharField()
+
+
+class AbnormalHandleSerializer(serializers.Serializer):
+    remark = serializers.CharField(required=False, allow_blank=True)
 
 
 class LoginSerializer(serializers.Serializer):

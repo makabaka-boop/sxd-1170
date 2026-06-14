@@ -189,6 +189,12 @@ class ReviewRecord(models.Model):
         return f'{self.headphone.serial_no} - {self.review_time}'
 
 
+class AbnormalStatus(models.TextChoices):
+    PENDING = 'pending', '未处理'
+    PROCESSING = 'processing', '处理中'
+    RESOLVED = 'resolved', '已处理'
+
+
 class AbnormalRecord(models.Model):
     ABNORMAL_TYPES = (
         ('low_battery', '连续低电量'),
@@ -214,7 +220,14 @@ class AbnormalRecord(models.Model):
     severity = models.CharField('严重程度', max_length=20, choices=SEVERITY, default='medium')
     description = models.TextField('异常描述')
     detected_time = models.DateTimeField('检测时间', auto_now_add=True)
-    resolved = models.BooleanField('已处理', default=False)
+    status = models.CharField('处理状态', max_length=20,
+                              choices=AbnormalStatus.choices,
+                              default=AbnormalStatus.PENDING)
+    handler = models.ForeignKey(User, on_delete=models.SET_NULL,
+                                verbose_name='处理人',
+                                related_name='handled_abnormal_records',
+                                null=True, blank=True)
+    handle_time = models.DateTimeField('处理时间', null=True, blank=True)
     resolve_remark = models.TextField('处理备注', blank=True)
 
     class Meta:
@@ -224,6 +237,10 @@ class AbnormalRecord(models.Model):
 
     def __str__(self):
         return f'{self.get_abnormal_type_display()} - {self.detected_time}'
+
+    @property
+    def resolved(self):
+        return self.status == AbnormalStatus.RESOLVED
 
 
 class UserProfile(models.Model):

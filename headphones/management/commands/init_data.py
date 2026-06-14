@@ -5,7 +5,8 @@ from datetime import timedelta
 
 from headphones.models import (
     Batch, Box, Headphone, BorrowRecord, DisinfectionRecord,
-    ReviewRecord, AbnormalRecord, UserProfile, UserRole, HeadphoneStatus
+    ReviewRecord, AbnormalRecord, UserProfile, UserRole, HeadphoneStatus,
+    AbnormalStatus
 )
 
 
@@ -313,7 +314,7 @@ class Command(BaseCommand):
         AbnormalRecord.objects.get_or_create(
             headphone=hp4,
             abnormal_type='overdue',
-            resolved=False,
+            status=AbnormalStatus.PENDING,
             defaults={
                 'severity': 'medium',
                 'description': f'耳机 {hp4.serial_no} 归还超时，预计归还时间 {expected_return_4}'
@@ -365,7 +366,7 @@ class Command(BaseCommand):
             headphone=hp6,
             batch=hp6.batch,
             abnormal_type='earpad_damage',
-            resolved=False,
+            status=AbnormalStatus.PENDING,
             defaults={
                 'severity': 'high',
                 'description': f'耳机 {hp6.serial_no} 耳罩破损严重，需要更换'
@@ -398,7 +399,7 @@ class Command(BaseCommand):
         AbnormalRecord.objects.get_or_create(
             headphone=self.headphones[10],
             abnormal_type='low_battery',
-            resolved=False,
+            status=AbnormalStatus.PENDING,
             defaults={
                 'severity': 'medium',
                 'description': f'耳机 {self.headphones[10].serial_no} 连续多次归还时电量低于30%'

@@ -91,12 +91,20 @@ class ReviewRecordAdmin(admin.ModelAdmin):
 class AbnormalRecordAdmin(admin.ModelAdmin):
     list_display = (
         'abnormal_type', 'severity', 'headphone', 'batch',
-        'detected_time', 'resolved'
+        'detected_time', 'status', 'handler', 'handle_time'
     )
-    search_fields = ('description', 'headphone__serial_no')
-    list_filter = ('abnormal_type', 'severity', 'resolved', 'detected_time')
+    search_fields = ('description', 'headphone__serial_no', 'handler__username')
+    list_filter = ('abnormal_type', 'severity', 'status', 'detected_time', 'handle_time')
     ordering = ('-detected_time',)
-    readonly_fields = ('detected_time',)
+    readonly_fields = ('detected_time', 'handler', 'handle_time')
+    fieldsets = (
+        (None, {
+            'fields': ('abnormal_type', 'severity', 'headphone', 'batch', 'description', 'detected_time')
+        }),
+        ('处理信息', {
+            'fields': ('status', 'handler', 'handle_time', 'resolve_remark')
+        }),
+    )
 
 
 admin.site.unregister(User)
