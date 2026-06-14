@@ -185,12 +185,14 @@ class HeadphoneActionView(APIView):
         serializer = BorrowActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        headphone_id = data['headphone_id']
 
         try:
-            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=headphone_id)
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
+        old_status = headphone.status
         if not headphone.can_borrow():
             return Response(
                 {'error': f'耳机当前状态为 {headphone.get_status_display()}，无法领出'},
@@ -198,7 +200,22 @@ class HeadphoneActionView(APIView):
             )
 
         expected_return = timezone.now() + timedelta(hours=data.get('expected_return_hours', 8))
+        updated_count = Headphone.objects.filter(
+            pk=headphone_id,
+            status=old_status
+        ).update(
+            status=HeadphoneStatus.IN_USE,
+            current_borrower=data['borrower'],
+            last_borrow_time=timezone.now()
+        )
+        if updated_count != 1:
+            transaction.set_rollback(True)
+            return Response(
+                {'error': '耳机状态已被其他操作变更，请刷新后重试'},
+                status=status.HTTP_409_CONFLICT
+            )
 
+        headphone = Headphone.objects.get(pk=headphone_id)
         borrow_record = BorrowRecord.objects.create(
             headphone=headphone,
             borrower=data['borrower'],
@@ -209,11 +226,6 @@ class HeadphoneActionView(APIView):
             operator_borrow=request.user
         )
 
-        headphone.status = HeadphoneStatus.IN_USE
-        headphone.current_borrower = data['borrower']
-        headphone.last_borrow_time = timezone.now()
-        headphone.save()
-
         result = BorrowRecordSerializer(borrow_record).data
         return Response(result, status=status.HTTP_201_CREATED)
 
@@ -222,12 +234,14 @@ class HeadphoneActionView(APIView):
         serializer = ReturnActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        headphone_id = data['headphone_id']
 
         try:
-            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=headphone_id)
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
+        old_status = headphone.status
         if not headphone.can_return():
             return Response(
                 {'error': f'耳机当前状态为 {headphone.get_status_display()}，无法归还'},
@@ -255,60 +269,91 @@ class HeadphoneActionView(APIView):
 
         borrow_record.save()
 
-        headphone.status = HeadphoneStatus.PENDING_DISINFECT
-        headphone.battery_level = data['battery_after']
-        headphone.earpad_damaged = data['earpad_damaged_after']
-        headphone.last_return_time = now
-        headphone.current_borrower = ''
-        headphone.save()
+        updated_count = Headphone.objects.filter(
+            pk=headphone_id,
+            status=old_status
+        ).update(
+            status=HeadphoneStatus.PENDING_DISINFECT,
+            battery_level=data['battery_after'],
+            earpad_damaged=data['earpad_damaged_after'],
+            last_return_time=now,
+            current_borrower=''
+        )
+        if updated_count != 1:
+            transaction.set_rollback(True)
+            return Response(
+                {'error': '耳机状态已被其他操作变更，请刷新后重试'},
+                status=status.HTTP_409_CONFLICT
+            )
 
+        headphone = Headphone.objects.get(pk=headphone_id)
         self._check_consecutive_low_battery(headphone, data['battery_after'])
         self._check_terminal_conflict(headphone, borrow_record)
 
         result = BorrowRecordSerializer(borrow_record).data
         return Response(result, status=status.HTTP_200_OK)
 
+    def _lock_box_and_check_capacity(self, box, exclude_headphone_id=None):
+        locked_box = Box.objects.select_for_update().get(pk=box.pk)
+        qs = Headphone.objects.filter(
+            box=locked_box,
+            status=HeadphoneStatus.PENDING_REVIEW
+        )
+        if exclude_headphone_id is not None:
+            qs = qs.exclude(pk=exclude_headphone_id)
+        pending_count = qs.count()
+        if pending_count >= locked_box.capacity:
+            return False, locked_box.box_no
+        return True, locked_box.box_no
+
     @transaction.atomic
     def _disinfect(self, request):
         serializer = DisinfectActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        headphone_id = data['headphone_id']
 
         try:
-            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=headphone_id)
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
+        old_status = headphone.status
         if not headphone.can_disinfect():
             return Response(
                 {'error': f'耳机当前状态为 {headphone.get_status_display()}，无法消杀'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        disinfect_result = data.get('result', True)
+        new_status = HeadphoneStatus.PENDING_REVIEW if disinfect_result else HeadphoneStatus.PENDING_DISINFECT
+
+        if disinfect_result and headphone.box:
+            ok, box_no = self._lock_box_and_check_capacity(headphone.box, headphone_id)
+            if not ok:
+                return Response(
+                    {'error': f'盒位 {box_no} 已被待复核耳机占满，无法进入待复核状态'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        updated_count = Headphone.objects.filter(
+            pk=headphone_id,
+            status=old_status
+        ).update(status=new_status)
+        if updated_count != 1:
+            transaction.set_rollback(True)
+            return Response(
+                {'error': '耳机状态已被其他操作变更，请刷新后重试'},
+                status=status.HTTP_409_CONFLICT
+            )
+
         disinfect_record = DisinfectionRecord.objects.create(
             headphone=headphone,
             operator=request.user,
             disinfect_method=data.get('disinfect_method', '酒精擦拭'),
-            result=data.get('result', True),
+            result=disinfect_result,
             remark=data.get('remark', '')
         )
-
-        if data.get('result', True):
-            if headphone.box:
-                pending_count = Headphone.objects.filter(
-                    box=headphone.box,
-                    status=HeadphoneStatus.PENDING_REVIEW
-                ).exclude(pk=headphone.pk).count()
-                if pending_count >= headphone.box.capacity:
-                    return Response(
-                        {'error': f'盒位 {headphone.box.box_no} 已被待复核耳机占满，无法进入待复核状态'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            headphone.status = HeadphoneStatus.PENDING_REVIEW
-        else:
-            headphone.status = HeadphoneStatus.PENDING_DISINFECT
-
-        headphone.save()
 
         result = DisinfectionRecordSerializer(disinfect_record).data
         return Response(result, status=status.HTTP_201_CREATED)
@@ -318,12 +363,14 @@ class HeadphoneActionView(APIView):
         serializer = ReviewActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        headphone_id = data['headphone_id']
 
         try:
-            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=headphone_id)
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
+        old_status = headphone.status
         if not headphone.can_review():
             return Response(
                 {'error': f'耳机当前状态为 {headphone.get_status_display()}，无法复核'},
@@ -336,8 +383,47 @@ class HeadphoneActionView(APIView):
         appearance_ok = data.get('appearance_ok', True)
         function_ok = data.get('function_ok', True)
 
-        if passed and not (battery_ok and appearance_ok and function_ok):
+        reasons = []
+        if earpad_damaged:
+            reasons.append('耳罩破损')
+        if not battery_ok:
+            reasons.append('电量异常')
+        if not appearance_ok:
+            reasons.append('外观异常')
+        if not function_ok:
+            reasons.append('功能异常')
+
+        if passed and reasons:
             passed = False
+
+        if passed:
+            new_status = HeadphoneStatus.AVAILABLE
+            suspend_reason = ''
+            update_fields = {'status': new_status}
+            if earpad_damaged:
+                update_fields['earpad_damaged'] = True
+        else:
+            new_status = HeadphoneStatus.OUT_OF_SERVICE
+            if not reasons:
+                reasons.append('复核不通过')
+            suspend_reason = data.get('remark', '、'.join(reasons))
+            update_fields = {
+                'status': new_status,
+                'suspend_reason': suspend_reason,
+            }
+            if earpad_damaged:
+                update_fields['earpad_damaged'] = True
+
+        updated_count = Headphone.objects.filter(
+            pk=headphone_id,
+            status=old_status
+        ).update(**update_fields)
+        if updated_count != 1:
+            transaction.set_rollback(True)
+            return Response(
+                {'error': '耳机状态已被其他操作变更，请刷新后重试'},
+                status=status.HTTP_409_CONFLICT
+            )
 
         review_record = ReviewRecord.objects.create(
             headphone=headphone,
@@ -350,25 +436,6 @@ class HeadphoneActionView(APIView):
             remark=data.get('remark', '')
         )
 
-        if passed:
-            headphone.status = HeadphoneStatus.AVAILABLE
-            if earpad_damaged:
-                headphone.earpad_damaged = True
-        else:
-            headphone.status = HeadphoneStatus.OUT_OF_SERVICE
-            reasons = []
-            if not battery_ok:
-                reasons.append('电量异常')
-            if not appearance_ok or earpad_damaged:
-                reasons.append('外观异常')
-            if not function_ok:
-                reasons.append('功能异常')
-            if not reasons:
-                reasons.append('复核不通过')
-            headphone.suspend_reason = data.get('remark', '、'.join(reasons))
-
-        headphone.save()
-
         result = ReviewRecordSerializer(review_record).data
         return Response(result, status=status.HTTP_201_CREATED)
 
@@ -377,22 +444,35 @@ class HeadphoneActionView(APIView):
         serializer = SuspendActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        headphone_id = data['headphone_id']
 
         try:
-            headphone = Headphone.objects.select_for_update().get(pk=data['headphone_id'])
+            headphone = Headphone.objects.select_for_update().get(pk=headphone_id)
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
-        if headphone.status == HeadphoneStatus.IN_USE:
+        old_status = headphone.status
+        if old_status == HeadphoneStatus.IN_USE:
             return Response(
                 {'error': '耳机正在使用中，请先归还再停用'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        headphone.status = HeadphoneStatus.OUT_OF_SERVICE
-        headphone.suspend_reason = data['reason']
-        headphone.save()
+        updated_count = Headphone.objects.filter(
+            pk=headphone_id,
+            status=old_status
+        ).update(
+            status=HeadphoneStatus.OUT_OF_SERVICE,
+            suspend_reason=data['reason']
+        )
+        if updated_count != 1:
+            transaction.set_rollback(True)
+            return Response(
+                {'error': '耳机状态已被其他操作变更，请刷新后重试'},
+                status=status.HTTP_409_CONFLICT
+            )
 
+        headphone = Headphone.objects.get(pk=headphone_id)
         result = HeadphoneSerializer(headphone).data
         return Response(result, status=status.HTTP_200_OK)
 
@@ -407,27 +487,36 @@ class HeadphoneActionView(APIView):
         except Headphone.DoesNotExist:
             return Response({'error': '耳机不存在'}, status=status.HTTP_404_NOT_FOUND)
 
-        if headphone.status != HeadphoneStatus.OUT_OF_SERVICE:
+        old_status = headphone.status
+        if old_status != HeadphoneStatus.OUT_OF_SERVICE:
             return Response(
                 {'error': f'只有停用观察的耳机才能激活，当前状态为 {headphone.get_status_display()}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         if headphone.box:
-            pending_count = Headphone.objects.filter(
-                box=headphone.box,
-                status=HeadphoneStatus.PENDING_REVIEW
-            ).exclude(pk=headphone.pk).count()
-            if pending_count >= headphone.box.capacity:
+            ok, box_no = self._lock_box_and_check_capacity(headphone.box, headphone_id)
+            if not ok:
                 return Response(
-                    {'error': f'盒位 {headphone.box.box_no} 已被待复核耳机占满，无法进入待复核状态'},
+                    {'error': f'盒位 {box_no} 已被待复核耳机占满，无法进入待复核状态'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        headphone.status = HeadphoneStatus.PENDING_REVIEW
-        headphone.suspend_reason = ''
-        headphone.save()
+        updated_count = Headphone.objects.filter(
+            pk=headphone_id,
+            status=old_status
+        ).update(
+            status=HeadphoneStatus.PENDING_REVIEW,
+            suspend_reason=''
+        )
+        if updated_count != 1:
+            transaction.set_rollback(True)
+            return Response(
+                {'error': '耳机状态已被其他操作变更，请刷新后重试'},
+                status=status.HTTP_409_CONFLICT
+            )
 
+        headphone = Headphone.objects.get(pk=headphone_id)
         result = HeadphoneSerializer(headphone).data
         return Response(result, status=status.HTTP_200_OK)
 
