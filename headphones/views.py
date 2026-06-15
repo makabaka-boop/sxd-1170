@@ -13,7 +13,7 @@ from datetime import timedelta
 from .models import (
     Batch, Box, Headphone, BorrowRecord, DisinfectionRecord,
     ReviewRecord, AbnormalRecord, UserProfile, HeadphoneStatus,
-    UserRole, AbnormalStatus
+    UserRole, AbnormalStatus, ExtensionApply, ExtensionApplyStatus
 )
 from .serializers import (
     BatchSerializer, BoxSerializer, HeadphoneSerializer, HeadphoneListSerializer,
@@ -21,11 +21,12 @@ from .serializers import (
     AbnormalRecordSerializer, AbnormalHandleSerializer,
     BorrowActionSerializer, ReturnActionSerializer,
     DisinfectActionSerializer, ReviewActionSerializer, SuspendActionSerializer,
-    UserSerializer, LoginSerializer
+    UserSerializer, LoginSerializer,
+    ExtensionApplySerializer, ExtensionApplyCreateSerializer, ExtensionApplyApproveSerializer
 )
 from .filters import (
     HeadphoneFilter, BorrowRecordFilter, AbnormalRecordFilter,
-    DisinfectionRecordFilter, ReviewRecordFilter
+    DisinfectionRecordFilter, ReviewRecordFilter, ExtensionApplyFilter
 )
 
 
@@ -159,6 +160,115 @@ class AbnormalRecordViewSet(viewsets.ModelViewSet):
         return Response(result, status=status.HTTP_200_OK)
 
 
+class ExtensionApplyViewSet(viewsets.ModelViewSet):
+    queryset = ExtensionApply.objects.all()
+    serializer_class = ExtensionApplySerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filterset_class = ExtensionApplyFilter
+    search_fields = ['reason', 'approve_remark', 'applicant_name', 'approver_name']
+    ordering_fields = ['apply_time', 'approve_time', 'extension_hours']
+
+    def get_permissions(self):
+        if self.action in ['approve', 'reject']:
+            return [permissions.IsAuthenticated(), IsAdminOrReadOnly()]
+        return [permissions.IsAuthenticated()]
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related(
+            'headphone', 'borrow_record', 'applicant', 'approver')
+        if not _is_user_admin(self.request.user):
+            qs = qs.filter(applicant=self.request.user)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = ExtensionApplyCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            borrow_record = BorrowRecord.objects.select_related('headphone').get(
+                pk=data['borrow_record_id']
+            )
+        except BorrowRecord.DoesNotExist:
+            return Response({'error': '领用记录不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if borrow_record.return_time:
+            return Response({'error': '该耳机已归还，无法申请延期'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if borrow_record.headphone.status != HeadphoneStatus.IN_USE:
+            return Response({'error': '耳机当前不在使用中'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not borrow_record.expected_return_time:
+            return Response({'error': '该领用记录没有预计归还时间'}, status=status.HTTP_400_BAD_REQUEST)
+
+        effective_return_time = borrow_record.get_effective_expected_return_time()
+        now = timezone.now()
+        if now > effective_return_time:
+            return Response({'error': '已超过预计归还时间，不允许申请延期'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if borrow_record.has_pending_extension():
+            return Response({'error': '已有待审批的延期申请'}, status=status.HTTP_400_BAD_REQUEST)
+
+        extension_hours = data['extension_hours']
+        requested_new_time = effective_return_time + timedelta(hours=extension_hours)
+
+        extension_apply = ExtensionApply.objects.create(
+            borrow_record=borrow_record,
+            headphone=borrow_record.headphone,
+            applicant=request.user,
+            applicant_name=request.user.username,
+            original_expected_return_time=borrow_record.expected_return_time,
+            extension_hours=extension_hours,
+            requested_new_return_time=requested_new_time,
+            reason=data['reason']
+        )
+
+        result = ExtensionApplySerializer(extension_apply).data
+        return Response(result, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        extension_apply = self.get_object()
+        if extension_apply.status != ExtensionApplyStatus.PENDING:
+            return Response(
+                {'error': '只有待审批的申请才能审批'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = ExtensionApplyApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            now = timezone.now()
+            extension_apply.status = ExtensionApplyStatus.APPROVED if data['approved'] else ExtensionApplyStatus.REJECTED
+            extension_apply.approver = request.user
+            extension_apply.approver_name = request.user.username
+            extension_apply.approve_time = now
+            extension_apply.approve_remark = data.get('approve_remark', '')
+
+            if data['approved']:
+                if 'extension_hours' in data and data['extension_hours']:
+                    extension_hours = data['extension_hours']
+                else:
+                    extension_hours = extension_apply.extension_hours
+                effective_return_time = extension_apply.borrow_record.get_effective_expected_return_time()
+                approved_new_time = effective_return_time + timedelta(hours=extension_hours)
+                extension_apply.approved_new_return_time = approved_new_time
+                extension_apply.extension_hours = extension_hours
+
+                borrow_record = extension_apply.borrow_record
+                if not borrow_record.original_expected_return_time is None:
+                    borrow_record.original_expected_return_time = borrow_record.expected_return_time
+                borrow_record.expected_return_time = approved_new_time
+                borrow_record.save()
+
+            extension_apply.save()
+
+        result = ExtensionApplySerializer(extension_apply).data
+        return Response(result, status=status.HTTP_200_OK)
+
+
 class HeadphoneActionView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     LOW_BATTERY_THRESHOLD = 30
@@ -220,6 +330,7 @@ class HeadphoneActionView(APIView):
             headphone=headphone,
             borrower=data['borrower'],
             expected_return_time=expected_return,
+            original_expected_return_time=expected_return,
             battery_before=headphone.battery_level,
             earpad_damaged_before=headphone.earpad_damaged,
             terminal_used=data.get('terminal_used', ''),
@@ -263,7 +374,8 @@ class HeadphoneActionView(APIView):
         borrow_record.return_remark = data.get('return_remark', '')
         borrow_record.operator_return = request.user
 
-        if borrow_record.expected_return_time and now > borrow_record.expected_return_time:
+        effective_return_time = borrow_record.get_effective_expected_return_time()
+        if effective_return_time and now > effective_return_time:
             borrow_record.is_overdue = True
             self._create_overdue_abnormal(headphone, borrow_record)
 
@@ -774,6 +886,24 @@ def statistics_view(request):
     )
     result['batch_stats'] = list(batch_stats)
 
+    extension_total = ExtensionApply.objects.count()
+    extension_approved = ExtensionApply.objects.filter(status=ExtensionApplyStatus.APPROVED).count()
+    extension_pending = ExtensionApply.objects.filter(status=ExtensionApplyStatus.PENDING).count()
+    extension_rejected = ExtensionApply.objects.filter(status=ExtensionApplyStatus.REJECTED).count()
+
+    extended_in_use_count = BorrowRecord.objects.filter(
+        return_time__isnull=True,
+        extension_applies__status=ExtensionApplyStatus.APPROVED
+    ).distinct().count()
+
+    result['extension_stats'] = {
+        'total_applies': extension_total,
+        'approved_count': extension_approved,
+        'pending_count': extension_pending,
+        'rejected_count': extension_rejected,
+        'extended_in_use_count': extended_in_use_count,
+    }
+
     return Response(result)
 
 
@@ -935,10 +1065,11 @@ def _detect_overdue(now):
     active_borrows = BorrowRecord.objects.filter(
         return_time__isnull=True,
         expected_return_time__isnull=False
-    ).select_related('headphone')
+    ).select_related('headphone').prefetch_related('extension_applies')
     for record in active_borrows:
-        if record.expected_return_time and now > record.expected_return_time:
-            overdue_hours = round((now - record.expected_return_time).total_seconds() / 3600, 1)
+        effective_return_time = record.get_effective_expected_return_time()
+        if effective_return_time and now > effective_return_time:
+            overdue_hours = round((now - effective_return_time).total_seconds() / 3600, 1)
             overdue_list.append({
                 'record_id': record.id,
                 'headphone_id': record.headphone.id,
@@ -946,6 +1077,8 @@ def _detect_overdue(now):
                 'borrower': record.borrower,
                 'borrow_time': record.borrow_time,
                 'expected_return_time': record.expected_return_time,
+                'effective_expected_return_time': effective_return_time,
+                'is_extended': record.is_extended(),
                 'overdue_hours': overdue_hours
             })
     return overdue_list

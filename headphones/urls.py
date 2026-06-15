@@ -13,6 +13,7 @@ router.register(r'borrow-records', views.BorrowRecordViewSet)
 router.register(r'disinfection-records', views.DisinfectionRecordViewSet)
 router.register(r'review-records', views.ReviewRecordViewSet)
 router.register(r'abnormal-records', views.AbnormalRecordViewSet)
+router.register(r'extension-applies', views.ExtensionApplyViewSet)
 
 urlpatterns = [
     path('', include(router.urls)),

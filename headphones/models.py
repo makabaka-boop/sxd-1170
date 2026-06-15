@@ -119,6 +119,7 @@ class BorrowRecord(models.Model):
     borrower = models.CharField('领用人', max_length=50)
     borrow_time = models.DateTimeField('领出时间', auto_now_add=True)
     expected_return_time = models.DateTimeField('预计归还时间', null=True, blank=True)
+    original_expected_return_time = models.DateTimeField('原始预计归还时间', null=True, blank=True)
     return_time = models.DateTimeField('归还时间', null=True, blank=True)
     battery_before = models.IntegerField('领出前电量(%)', null=True, blank=True)
     battery_after = models.IntegerField('归还时电量(%)', null=True, blank=True)
@@ -145,7 +146,67 @@ class BorrowRecord(models.Model):
     def check_overdue(self):
         if self.return_time or not self.expected_return_time:
             return False
-        return timezone.now() > self.expected_return_time
+        approved_extension = self.extension_applies.filter(
+            status=ExtensionApplyStatus.APPROVED
+        ).order_by('-apply_time').first()
+        effective_return_time = approved_extension.approved_new_return_time if approved_extension else self.expected_return_time
+        return timezone.now() > effective_return_time
+
+    def get_effective_expected_return_time(self):
+        approved_extension = self.extension_applies.filter(
+            status=ExtensionApplyStatus.APPROVED
+        ).order_by('-apply_time').first()
+        if approved_extension:
+            return approved_extension.approved_new_return_time
+        return self.expected_return_time
+
+    def has_pending_extension(self):
+        return self.extension_applies.filter(
+            status=ExtensionApplyStatus.PENDING
+        ).exists()
+
+    def is_extended(self):
+        return self.extension_applies.filter(
+            status=ExtensionApplyStatus.APPROVED
+        ).exists()
+
+
+class ExtensionApplyStatus(models.TextChoices):
+    PENDING = 'pending', '待审批'
+    APPROVED = 'approved', '已通过'
+    REJECTED = 'rejected', '已驳回'
+
+
+class ExtensionApply(models.Model):
+    borrow_record = models.ForeignKey(BorrowRecord, on_delete=models.CASCADE,
+                                      verbose_name='领用记录', related_name='extension_applies')
+    headphone = models.ForeignKey(Headphone, on_delete=models.CASCADE,
+                                  verbose_name='耳机', related_name='extension_applies')
+    applicant = models.ForeignKey(User, on_delete=models.SET_NULL, null=True,
+                                  verbose_name='申请人', related_name='extension_applies')
+    applicant_name = models.CharField('申请人姓名', max_length=50, blank=True)
+    apply_time = models.DateTimeField('申请时间', auto_now_add=True)
+    original_expected_return_time = models.DateTimeField('原预计归还时间')
+    extension_hours = models.IntegerField('延期时长(小时)')
+    requested_new_return_time = models.DateTimeField('申请的新预计归还时间')
+    approved_new_return_time = models.DateTimeField('审批通过的新预计归还时间', null=True, blank=True)
+    reason = models.TextField('延期原因')
+    status = models.CharField('申请状态', max_length=20,
+                              choices=ExtensionApplyStatus.choices,
+                              default=ExtensionApplyStatus.PENDING)
+    approver = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
+                                 verbose_name='审批人', related_name='approved_extensions')
+    approver_name = models.CharField('审批人姓名', max_length=50, blank=True)
+    approve_time = models.DateTimeField('审批时间', null=True, blank=True)
+    approve_remark = models.TextField('审批备注', blank=True)
+
+    class Meta:
+        verbose_name = '归还延期申请'
+        verbose_name_plural = '归还延期申请'
+        ordering = ['-apply_time']
+
+    def __str__(self):
+        return f'{self.headphone.serial_no} - {self.applicant_name} - {self.get_status_display()}'
 
 
 class DisinfectionRecord(models.Model):

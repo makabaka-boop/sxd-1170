@@ -2,7 +2,8 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from .models import (
     Batch, Box, Headphone, BorrowRecord, DisinfectionRecord,
-    ReviewRecord, AbnormalRecord, UserProfile, HeadphoneStatus
+    ReviewRecord, AbnormalRecord, UserProfile, HeadphoneStatus,
+    ExtensionApply, ExtensionApplyStatus
 )
 
 
@@ -43,10 +44,43 @@ class BoxSerializer(serializers.ModelSerializer):
         return obj.get_pending_review_count()
 
 
+class ExtensionApplySerializer(serializers.ModelSerializer):
+    headphone_serial = serializers.CharField(source='headphone.serial_no', read_only=True)
+    borrower = serializers.CharField(source='borrow_record.borrower', read_only=True)
+    borrow_record_id = serializers.IntegerField(source='borrow_record.id', read_only=True)
+    applicant_username = serializers.CharField(source='applicant.username', read_only=True, allow_null=True)
+    approver_username = serializers.CharField(source='approver.username', read_only=True, allow_null=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = ExtensionApply
+        fields = '__all__'
+        read_only_fields = [
+            'apply_time', 'applicant', 'applicant_name',
+            'original_expected_return_time', 'requested_new_return_time',
+            'approved_new_return_time', 'status', 'approver',
+            'approver_name', 'approve_time', 'headphone', 'borrow_record'
+        ]
+
+
+class ExtensionApplyCreateSerializer(serializers.Serializer):
+    borrow_record_id = serializers.IntegerField()
+    extension_hours = serializers.IntegerField(min_value=1)
+    reason = serializers.CharField()
+
+
+class ExtensionApplyApproveSerializer(serializers.Serializer):
+    approved = serializers.BooleanField()
+    approve_remark = serializers.CharField(required=False, allow_blank=True)
+    extension_hours = serializers.IntegerField(required=False, min_value=1)
+
+
 class HeadphoneSerializer(serializers.ModelSerializer):
     batch_info = serializers.SerializerMethodField()
     box_info = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    extension_applies = serializers.SerializerMethodField()
+    current_extension = serializers.SerializerMethodField()
 
     class Meta:
         model = Headphone
@@ -63,11 +97,31 @@ class HeadphoneSerializer(serializers.ModelSerializer):
             return {'id': obj.box.id, 'box_no': obj.box.box_no, 'location': obj.box.location}
         return None
 
+    def get_extension_applies(self, obj):
+        applies = obj.extension_applies.all()[:10]
+        return ExtensionApplySerializer(applies, many=True).data
+
+    def get_current_extension(self, obj):
+        latest_approved = obj.extension_applies.filter(
+            status=ExtensionApplyStatus.APPROVED,
+            borrow_record__return_time__isnull=True
+        ).order_by('-apply_time').first()
+        if latest_approved:
+            return ExtensionApplySerializer(latest_approved).data
+        pending = obj.extension_applies.filter(
+            status=ExtensionApplyStatus.PENDING,
+            borrow_record__return_time__isnull=True
+        ).order_by('-apply_time').first()
+        if pending:
+            return ExtensionApplySerializer(pending).data
+        return None
+
 
 class HeadphoneListSerializer(serializers.ModelSerializer):
     batch_no = serializers.CharField(source='batch.batch_no', read_only=True)
     box_no = serializers.CharField(source='box.box_no', read_only=True, allow_null=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    has_extension = serializers.SerializerMethodField()
 
     class Meta:
         model = Headphone
@@ -75,19 +129,48 @@ class HeadphoneListSerializer(serializers.ModelSerializer):
             'id', 'serial_no', 'batch', 'batch_no', 'box', 'box_no',
             'compatible_terminal', 'responsible_person', 'status', 'status_display',
             'battery_level', 'earpad_damaged', 'current_borrower',
-            'last_borrow_time', 'last_return_time'
+            'last_borrow_time', 'last_return_time', 'has_extension'
         ]
+
+    def get_has_extension(self, obj):
+        return obj.extension_applies.filter(
+            borrow_record__return_time__isnull=True
+        ).exists()
 
 
 class BorrowRecordSerializer(serializers.ModelSerializer):
     headphone_serial = serializers.CharField(source='headphone.serial_no', read_only=True)
     operator_borrow_name = serializers.CharField(source='operator_borrow.username', read_only=True)
     operator_return_name = serializers.CharField(source='operator_return.username', read_only=True)
+    extension_applies = serializers.SerializerMethodField()
+    latest_extension = serializers.SerializerMethodField()
+    effective_expected_return_time = serializers.SerializerMethodField()
+    is_extended = serializers.SerializerMethodField()
+    has_pending_extension = serializers.SerializerMethodField()
 
     class Meta:
         model = BorrowRecord
         fields = '__all__'
-        read_only_fields = ['borrow_time', 'operator_borrow']
+        read_only_fields = ['borrow_time', 'operator_borrow', 'original_expected_return_time']
+
+    def get_extension_applies(self, obj):
+        applies = obj.extension_applies.all()
+        return ExtensionApplySerializer(applies, many=True).data
+
+    def get_latest_extension(self, obj):
+        latest = obj.extension_applies.order_by('-apply_time').first()
+        if latest:
+            return ExtensionApplySerializer(latest).data
+        return None
+
+    def get_effective_expected_return_time(self, obj):
+        return obj.get_effective_expected_return_time()
+
+    def get_is_extended(self, obj):
+        return obj.is_extended()
+
+    def get_has_pending_extension(self, obj):
+        return obj.has_pending_extension()
 
 
 class DisinfectionRecordSerializer(serializers.ModelSerializer):

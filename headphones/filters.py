@@ -1,5 +1,5 @@
 import django_filters
-from .models import Headphone, BorrowRecord, AbnormalRecord, DisinfectionRecord, ReviewRecord
+from .models import Headphone, BorrowRecord, AbnormalRecord, DisinfectionRecord, ReviewRecord, ExtensionApply
 
 
 class HeadphoneFilter(django_filters.FilterSet):
@@ -33,6 +33,7 @@ class BorrowRecordFilter(django_filters.FilterSet):
     return_end = django_filters.DateTimeFilter(field_name='return_time', lookup_expr='lte')
     is_overdue = django_filters.BooleanFilter()
     has_returned = django_filters.BooleanFilter(method='filter_has_returned')
+    is_extended = django_filters.BooleanFilter(method='filter_is_extended')
 
     class Meta:
         model = BorrowRecord
@@ -42,6 +43,31 @@ class BorrowRecordFilter(django_filters.FilterSet):
         if value:
             return queryset.filter(return_time__isnull=False)
         return queryset.filter(return_time__isnull=True)
+
+    def filter_is_extended(self, queryset, name, value):
+        if value:
+            return queryset.filter(extension_applies__status='approved').distinct()
+        return queryset.exclude(extension_applies__status='approved').distinct()
+
+
+class ExtensionApplyFilter(django_filters.FilterSet):
+    status = django_filters.CharFilter(lookup_expr='exact')
+    applicant = django_filters.CharFilter(field_name='applicant__username', lookup_expr='icontains')
+    applicant_name = django_filters.CharFilter(lookup_expr='icontains')
+    approver = django_filters.CharFilter(field_name='approver__username', lookup_expr='icontains')
+    approver_name = django_filters.CharFilter(lookup_expr='icontains')
+    headphone = django_filters.CharFilter(field_name='headphone__serial_no', lookup_expr='icontains')
+    headphone_id = django_filters.NumberFilter(field_name='headphone_id')
+    borrow_record_id = django_filters.NumberFilter(field_name='borrow_record_id')
+    borrower = django_filters.CharFilter(field_name='borrow_record__borrower', lookup_expr='icontains')
+    apply_start = django_filters.DateTimeFilter(field_name='apply_time', lookup_expr='gte')
+    apply_end = django_filters.DateTimeFilter(field_name='apply_time', lookup_expr='lte')
+    approve_start = django_filters.DateTimeFilter(field_name='approve_time', lookup_expr='gte')
+    approve_end = django_filters.DateTimeFilter(field_name='approve_time', lookup_expr='lte')
+
+    class Meta:
+        model = ExtensionApply
+        fields = ['status', 'applicant', 'approver']
 
 
 class AbnormalRecordFilter(django_filters.FilterSet):
